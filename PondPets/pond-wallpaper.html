@@ -1,0 +1,767 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>养鱼桌面 · Pond Pets</title>
+<style>
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0;width:100%;height:100%;overflow:hidden;background:#000}
+  body{font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif}
+  #pondCanvas{position:fixed;inset:0;width:100%;height:100%;display:block;cursor:pointer}
+  #panel{position:fixed;left:16px;top:16px;z-index:5;color:#eafff6;font-size:13px;
+    background:rgba(5,30,27,.55);backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);
+    padding:8px 12px;border-radius:999px;pointer-events:none;transition:opacity .4s}
+  #panel.hidden{opacity:0}
+  #panel b{color:#ffd166}
+  #hint{position:fixed;left:50%;bottom:22px;transform:translateX(-50%);z-index:5;color:#eafff6;
+    font-size:13px;background:rgba(5,30,27,.45);padding:7px 13px;border-radius:999px;pointer-events:none;transition:opacity .4s;white-space:nowrap}
+  #hint.hidden{opacity:0}
+</style>
+</head>
+<body>
+<canvas id="pondCanvas"></canvas>
+<div id="panel" class="hidden">🐟 <b id="fishCount">5</b> 条鱼 · 饱食度 <b id="satietyLabel">72%</b> · <span id="modeLabel">正午</span></div>
+<div id="hint" class="hidden">点一下水面喂食 · 拖动赶鱼 · Esc 回到壁纸</div>
+<script>
+(function(){
+"use strict";
+var canvas=document.getElementById('pondCanvas');
+var ctx=canvas.getContext('2d');
+var W=0,H=0,DPR=1;
+var panelEl=document.getElementById('panel'), hintEl=document.getElementById('hint');
+var showPanel=false, showNames=false, embedded=false, paused=false;
+
+/* ---------- 时段 / 速度 / 天气 ---------- */
+var MODES={
+  dawn:{top:'#8fd0b8',mid:'#4aa78e',bot:'#1d5c50',label:'清晨'},
+  noon:{top:'#79c9b4',mid:'#2f9a86',bot:'#14584c',label:'正午'},
+  dusk:{top:'#e8b07e',mid:'#4f8f7d',bot:'#173f3d',label:'黄昏'},
+  night:{top:'#274b63',mid:'#123a4a',bot:'#081f2c',label:'夜晚'}
+};
+var MODE_ORDER=['dawn','noon','dusk','night'];
+var mode='noon', speedIndex=0, weatherName='auto', effWeather='clear';
+var cycleTimer=null, cycleIdx=1;
+var reduced=window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+function modeFromClock(){
+  var h=new Date().getHours();
+  if(h>=5&&h<8) return 'dawn';
+  if(h>=8&&h<17) return 'noon';
+  if(h>=17&&h<20) return 'dusk';
+  return 'night';
+}
+function applyMode(m){
+  mode=m;
+  document.getElementById('modeLabel').textContent=MODES[m].label;
+}
+function applySpeed(idx){
+  speedIndex=idx;
+  if(cycleTimer){clearInterval(cycleTimer);cycleTimer=null;}
+  if(idx===0){ applyMode(modeFromClock()); }
+  else{
+    var intervals=[30000,10000,5000,2000];
+    cycleIdx=MODE_ORDER.indexOf(mode); if(cycleIdx<0) cycleIdx=1;
+    cycleTimer=setInterval(function(){
+      cycleIdx=(cycleIdx+1)%MODE_ORDER.length;
+      applyMode(MODE_ORDER[cycleIdx]);
+    }, intervals[Math.min(3,idx-1)]);
+  }
+}
+function applyWeather(name){
+  weatherName=name;
+  if(name==='auto'){ effWeather='clear'; return; }
+  effWeather=name;
+}
+setInterval(function(){ if(speedIndex===0) applyMode(modeFromClock()); }, 60000);
+applySpeed(0); applyWeather('auto');
+
+/* ---------- 天气粒子 ---------- */
+var rainDrops=[], snowFlakes=[];
+function spawnWeather(){
+  if(effWeather==='rain' && rainDrops.length<160){
+    rainDrops.push({x:Math.random()*W,y:-10,v:11+Math.random()*6,lean:-2.2});
+  }
+  if(effWeather==='snow' && snowFlakes.length<110){
+    snowFlakes.push({x:Math.random()*W,y:-8,r:1.5+Math.random()*2.5,v:0.7+Math.random()*0.9,ph:Math.random()*6.28});
+  }
+}
+
+/* ---------- 环境音：Web Audio 合成，零音频文件 ---------- */
+var audioCtx=null, soundNodes={};
+function ensureAudio(){
+  if(audioCtx) return audioCtx;
+  try{
+    var AC=window.AudioContext||window.webkitAudioContext;
+    if(!AC) return null;
+    audioCtx=new AC();
+  }catch(e){ return null; }
+  return audioCtx;
+}
+function noiseBuffer(c){
+  var len=c.sampleRate*2, buf=c.createBuffer(1,len,c.sampleRate), d=buf.getChannelData(0);
+  for(var i=0;i<len;i++) d[i]=Math.random()*2-1;
+  return buf;
+}
+function startNoise(key, filterType, freq, gainVal){
+  var c=ensureAudio(); if(!c) return;
+  if(c.state==='suspended') c.resume();
+  var src=c.createBufferSource(); src.buffer=noiseBuffer(c); src.loop=true;
+  var f=c.createBiquadFilter(); f.type=filterType; f.frequency.value=freq;
+  var g=c.createGain(); g.gain.value=gainVal;
+  src.connect(f); f.connect(g); g.connect(c.destination); src.start();
+  soundNodes[key]={src:src,gain:g};
+}
+function startBlips(key, freq, gapMin, gapMax, dur, gainVal){
+  var c=ensureAudio(); if(!c) return;
+  if(c.state==='suspended') c.resume();
+  var g=c.createGain(); g.gain.value=gainVal; g.connect(c.destination);
+  var timer=setInterval(function(){
+    if(!soundNodes[key]) { clearInterval(timer); return; }
+    var o=c.createOscillator(); o.type='sine'; o.frequency.value=freq*(0.9+Math.random()*0.2);
+    var og=c.createGain();
+    var t0=c.currentTime;
+    og.gain.setValueAtTime(0,t0);
+    og.gain.linearRampToValueAtTime(1,t0+0.02);
+    og.gain.exponentialRampToValueAtTime(0.001,t0+dur);
+    o.connect(og); og.connect(g);
+    o.start(t0); o.stop(t0+dur+0.05);
+  }, gapMin+Math.random()*(gapMax-gapMin));
+  soundNodes[key]={gain:g,timer:timer};
+}
+function setSoundInternal(key,on){
+  if(!on){
+    var n=soundNodes[key]; if(!n) return;
+    try{ if(n.src) n.src.stop(); }catch(e){}
+    try{ if(n.timer) clearInterval(n.timer); }catch(e){}
+    try{ if(n.gain) n.gain.disconnect(); }catch(e){}
+    delete soundNodes[key]; return;
+  }
+  if(soundNodes[key]) return;
+  if(key==='s_stream') startNoise('s_stream','lowpass',420,0.05);
+  else if(key==='s_rain') startNoise('s_rain','highpass',900,0.04);
+  else if(key==='s_frog') startBlips('s_frog',190,1800,4200,0.22,0.10);
+  else if(key==='s_cricket') startBlips('s_cricket',4200,500,1400,0.09,0.03);
+}
+document.addEventListener('pointerdown', function(){ ensureAudio(); if(audioCtx&&audioCtx.state==='suspended') audioCtx.resume(); }, {passive:true});
+
+/* ---------- 鱼种 ---------- */
+var SPECIES=[
+  {name:'大牙',sp:'红腹食人鱼',color:'#7d848d',belly:'#e8542f',pattern:'piranha',tail:'fork',fin:'#5d646d',plump:1.28,len:[72,88],trait:'鱼群头领，抢食永远第一个冲到'},
+  {name:'红肚',sp:'红腹食人鱼',color:'#868d96',belly:'#d8401a',pattern:'piranha',tail:'fork',fin:'#646b74',plump:1.25,len:[70,86],trait:'肚子最红，游起来横冲直撞'},
+  {name:'刀锋',sp:'红腹食人鱼',color:'#757c85',belly:'#e05a2a',pattern:'piranha',tail:'fork',fin:'#585f68',plump:1.22,len:[68,84],trait:'牙齿最利，爱在鱼群外围巡逻'},
+  {name:'闪电',sp:'红腹食人鱼',color:'#8a919a',belly:'#d94f24',pattern:'piranha',tail:'fork',fin:'#6b727b',plump:1.20,len:[66,82],trait:'速度最快，一道银光就过去了'},
+  {name:'血牙',sp:'红腹食人鱼',color:'#7a818a',belly:'#e8542f',pattern:'piranha',tail:'fork',fin:'#5a616a',plump:1.26,len:[70,86],trait:'受惊时第一个炸群，也第一个回来'},
+  {name:'铁颚',sp:'黑食人鱼',color:'#4c525a',belly:'#b03a1e',pattern:'piranha',tail:'fork',fin:'#3a4047',plump:1.32,len:[76,92],trait:'体型最大，咬合力最强，夜里几乎隐身'},
+  {name:'旋风',sp:'红腹食人鱼',color:'#828993',belly:'#dd5a30',pattern:'piranha',tail:'fork',fin:'#666d76',plump:1.22,len:[66,82],trait:'爱绕着圈游，鱼群的侦察兵'},
+  {name:'赤鳞',sp:'红腹食人鱼',color:'#7d848d',belly:'#e05a2a',pattern:'piranha',tail:'fork',fin:'#5d646d',plump:1.24,len:[68,86],trait:'鳞片泛红光，太阳下最显眼'},
+  {name:'钢牙',sp:'红腹食人鱼',color:'#7d848d',belly:'#e8542f',pattern:'piranha',tail:'fork',fin:'#5d646d',plump:1.25,len:[70,86],trait:'牙口很好，专挑大块的吃'},
+  {name:'火腹',sp:'红腹食人鱼',color:'#868d96',belly:'#d8401a',pattern:'piranha',tail:'fork',fin:'#646b74',plump:1.23,len:[68,84],trait:'肚子火红，食欲旺盛'},
+  {name:'疾风',sp:'红腹食人鱼',color:'#828993',belly:'#dd5a30',pattern:'piranha',tail:'fork',fin:'#666d76',plump:1.20,len:[64,80],trait:'游得飞快，追食小能手'},
+  {name:'寒光',sp:'黑食人鱼',color:'#4c525a',belly:'#b03a1e',pattern:'piranha',tail:'fork',fin:'#3a4047',plump:1.30,len:[72,88],trait:'通体发黑，眼神很冷'},
+  {name:'怒涛',sp:'红腹食人鱼',color:'#757c85',belly:'#e05a2a',pattern:'piranha',tail:'fork',fin:'#585f68',plump:1.24,len:[68,84],trait:'脾气最爆，抢食从不让鱼'},
+  {name:'烈牙',sp:'红腹食人鱼',color:'#7d848d',belly:'#e8542f',pattern:'piranha',tail:'fork',fin:'#5d646d',plump:1.26,len:[70,86],trait:'獠牙外露，看着就不好惹'},
+  {name:'暗流',sp:'红腹食人鱼',color:'#6e757e',belly:'#cf4a22',pattern:'piranha',tail:'fork',fin:'#525860',plump:1.22,len:[66,82],trait:'总贴着底层阴影游，不声不响'},
+  {name:'狂潮',sp:'红腹食人鱼',color:'#868d96',belly:'#d8401a',pattern:'piranha',tail:'fork',fin:'#646b74',plump:1.24,len:[68,84],trait:'一兴奋就带头冲锋，鱼群都跟上'}
+];
+var EXTRA_NAMES=[
+  {name:'血月',sp:'红腹食人鱼',color:'#7d848d',belly:'#d8401a',pattern:'piranha',tail:'fork',fin:'#5d646d',plump:1.25,len:[68,84],trait:'夜里眼睛发红光'},
+  {name:'锋芒',sp:'红腹食人鱼',color:'#868d96',belly:'#e8542f',pattern:'piranha',tail:'fork',fin:'#646b74',plump:1.22,len:[66,82],trait:'背鳍像刀一样立着'},
+  {name:'巨颚',sp:'黑食人鱼',color:'#4c525a',belly:'#b03a1e',pattern:'piranha',tail:'fork',fin:'#3a4047',plump:1.32,len:[74,90],trait:'下巴宽得能吞下整块鱼食'},
+  {name:'暗影',sp:'黑食人鱼',color:'#545a63',belly:'#a8351c',pattern:'piranha',tail:'fork',fin:'#42484f',plump:1.26,len:[70,86],trait:'神出鬼没，突然出现吓你一跳'},
+  {name:'烈焰',sp:'红腹食人鱼',color:'#828993',belly:'#e05a2a',pattern:'piranha',tail:'fork',fin:'#666d76',plump:1.24,len:[68,84],trait:'浑身像着了火，抢食最疯'},
+  {name:'撕风',sp:'红腹食人鱼',color:'#7a818a',belly:'#dd5a30',pattern:'piranha',tail:'fork',fin:'#5a616a',plump:1.22,len:[66,82],trait:'转弯快得像撕开水面'}
+];
+function rand(a,b){ return a+Math.random()*(b-a); }
+var fishes=[], foods=[], bubbles=[], ripples=[], plants=[], pebbles=[], backPlants=[], frontPlants=[], motes=[];
+var extraIdx=0, taps=0, satiety=72, greetIdx=-1, greetTimer=0;
+
+function makeFish(spec,x,y){
+  var f={name:spec.name,sp:spec.sp,color:spec.color,belly:spec.belly,trait:spec.trait||'',
+    pattern:spec.pattern||'plain',patchColor:spec.patch||null,neon:spec.neon||null,
+    tailType:spec.tail||'fork',tailColor:spec.tailColor||null,finColor:spec.fin||spec.color,
+    plump:spec.plump||1,ghost:spec.ghost||0,placed:false,
+    x:(x!=null?x:80),y:(y!=null?y:80),vx:rand(-.4,.4),vy:rand(-.15,.15),
+    len:rand(spec.len[0],spec.len[1]),wave:rand(0,Math.PI*2),wag:0.6,patches:[],
+    phase:rand(0,Math.PI*2),speed:rand(.7,1.15),scared:0,spin:0};
+  f.maxW=f.len*0.155*f.plump;
+  if(f.pattern==='koi'){
+    var np=3+Math.floor(rand(0,3));
+    for(var i=0;i<np;i++) f.patches.push({u:rand(.16,.82),off:rand(-.8,.45),r:rand(.55,1.05),rot:rand(0,3.14)});
+  }
+  if(f.pattern==='spot'){ f.patches.push({u:.09,off:-.5,r:.85,rot:rand(0,3)}); }
+  if(f.pattern==='piranha'){
+    f.speckles=[];
+    for(var si=0;si<16;si++) f.speckles.push({u:rand(0.10,0.80),off:rand(0.15,0.75),r:rand(0.5,1.1)});
+  }
+  return f;
+}
+SPECIES.forEach(function(s){ fishes.push(makeFish(s)); });
+
+/* ---------- 持久化：localStorage（鱼数量 / 饱食度 / 互动） ---------- */
+var STORE_KEY='pondPetsV1';
+function saveState(){
+  try{
+    var added=fishes.slice(SPECIES.length).map(function(f){return f.name;});
+    localStorage.setItem(STORE_KEY, JSON.stringify({added:added,satiety:Math.round(satiety),taps:taps,extraIdx:extraIdx}));
+  }catch(e){}
+}
+function loadState(){
+  try{
+    var raw=localStorage.getItem(STORE_KEY); if(!raw) return;
+    var s=JSON.parse(raw);
+    if(typeof s.satiety==='number') satiety=Math.max(0,Math.min(100,s.satiety));
+    if(typeof s.taps==='number') taps=s.taps;
+    if(typeof s.extraIdx==='number') extraIdx=s.extraIdx;
+    (s.added||[]).forEach(function(nm){
+      var spec=null;
+      for(var i=0;i<EXTRA_NAMES.length;i++){ if(EXTRA_NAMES[i].name===nm){spec=EXTRA_NAMES[i];break;} }
+      if(spec && fishes.length<10) fishes.push(makeFish(spec));
+    });
+  }catch(e){}
+}
+loadState();
+function updatePanel(){
+  document.getElementById('fishCount').textContent=fishes.length;
+  document.getElementById('satietyLabel').textContent=Math.round(satiety)+'%';
+}
+setInterval(function(){ satiety=Math.max(18,satiety-0.7); updatePanel(); saveState(); }, 5000);
+updatePanel();
+
+/* ---------- 布景 ---------- */
+var BLADE_COLS=[
+  ['rgba(13,74,44,.94)','rgba(64,175,105,.95)'],
+  ['rgba(11,64,40,.94)','rgba(88,196,120,.95)'],
+  ['rgba(16,88,50,.94)','rgba(46,160,95,.95)']
+];
+function grassCluster(x,hMin,hMax,blades,dark){
+  var bl=[],mx=0;
+  for(var b=0;b<blades;b++){
+    var bh=rand(hMin,hMax); if(bh>mx)mx=bh;
+    var c=dark?['rgba(5,36,22,.92)','rgba(9,58,36,.92)']:BLADE_COLS[Math.floor(rand(0,3))%3];
+    bl.push({h:bh,lean:rand(-16,16),w:rand(3.4,5.8),ph:rand(0,6.28),c0:c[0],c1:c[1]});
+  }
+  return {type:'grass',x:x,h:mx,blades:bl,dark:!!dark};
+}
+function buildScenery(){
+  plants=[];pebbles=[];backPlants=[];frontPlants=[];motes=[];
+  var n=Math.max(6,Math.floor(W/115)),i,k;
+  for(i=0;i<n;i++){
+    var x=(i+0.5)*(W/n)+rand(-24,24);
+    if(i%3===2){
+      var lh=rand(64,112),leaves=[],nl=6+Math.floor(rand(0,3));
+      for(k=0;k<nl;k++) leaves.push({v:0.22+0.74*(k/Math.max(1,nl-1)),side:k%2?1:-1,len:rand(15,26),wid:rand(5.5,8.5),ph:rand(0,6.28)});
+      plants.push({type:'leafy',x:x,h:lh,lean:rand(-8,8),ph:rand(0,6.28),leaves:leaves});
+    } else {
+      plants.push(grassCluster(x,52,138,6+Math.floor(rand(0,4)),false));
+    }
+  }
+  var nb2=Math.max(4,Math.floor(W/170));
+  for(i=0;i<nb2;i++){
+    var bx=(i+0.5)*(W/nb2)+rand(-30,30),bl=[],mx=0;
+    for(k=0;k<5;k++){ var qh=rand(72,152); if(qh>mx)mx=qh; bl.push({h:qh,lean:rand(-18,18),w:rand(4,7),ph:rand(0,6.28),c0:'',c1:''}); }
+    backPlants.push({type:'grass',x:bx,h:mx,blades:bl});
+  }
+  [16,W-16].forEach(function(fx){ frontPlants.push(grassCluster(fx,58,118,6,true)); });
+  for(i=0;i<26;i++) pebbles.push({x:rand(0,W),y:H-rand(2,18),r:rand(4,13),a:rand(.10,.3)});
+  for(i=0;i<34;i++) motes.push({x:rand(0,W),y:rand(0,H),r:rand(.7,1.9),ph:rand(0,6.28),sp:rand(.04,.12)});
+}
+function resize(){
+  DPR=Math.min(2,window.devicePixelRatio||1);
+  W=window.innerWidth; H=window.innerHeight;
+  canvas.width=Math.round(W*DPR); canvas.height=Math.round(H*DPR);
+  ctx.setTransform(DPR,0,0,DPR,0,0);
+  buildScenery();
+  fishes.forEach(function(f,i){
+    if(!f.placed && W>200){
+      f.x=W*(0.14+0.72*((i*0.37+0.12)%1));
+      f.y=H*(0.22+0.55*((i*0.53+0.2)%1));
+      f.vx=(i%2===0?1:-1)*rand(.4,.8);
+      f.placed=true;
+    }
+  });
+}
+window.addEventListener('resize',resize);
+resize();
+
+/* ---------- 交互：点水面 = 撒食 ---------- */
+function dropFood(x,y,n){
+  for(var i=0;i<(n||6);i++){
+    foods.push({x:x+rand(-16,16),y:y+rand(-6,10),vy:rand(.25,.5),r:rand(2.2,3.4),drift:rand(-.08,.08)});
+  }
+  satiety=Math.min(100,satiety+9); updatePanel(); saveState();
+}
+function addRipple(x,y,big){ ripples.push({x:x,y:y,r:big?10:4,max:big?120:64,a:.55}); }
+function scare(cx,cy){
+  fishes.forEach(function(f){
+    var dx=f.x-cx,dy=f.y-cy,d=Math.max(30,Math.hypot(dx,dy));
+    f.vx+=(dx/d)*3.2; f.vy+=(dy/d)*1.6; f.scared=90;
+  });
+}
+canvas.addEventListener('pointerdown',function(e){
+  taps++;
+  dropFood(e.clientX,Math.max(24,e.clientY),5);
+  addRipple(e.clientX,e.clientY,false);
+  saveState();
+});
+function centerFeed(){ dropFood(W*rand(.3,.7),H*.3,8); taps++; saveState(); }
+function tapGlass(){ addRipple(W/2,H/2,true); scare(W/2,H/2); taps++; saveState(); }
+function addFish(){
+  if(fishes.length>=20) return false;
+  var spec=EXTRA_NAMES[extraIdx%EXTRA_NAMES.length]; extraIdx++;
+  var f=makeFish(spec);
+  f.x=rand(W*0.25,W*0.75); f.y=rand(H*0.3,H*0.65); f.placed=true;
+  fishes.push(f); updatePanel(); dropFood(f.x,f.y-20,3); saveState();
+  return true;
+}
+
+/* ---------- 鱼：脊柱摆动渲染（与原型同一套） ---------- */
+function spinePts(f){
+  var L=f.len,N=14,pts=[],i,u;
+  for(i=0;i<=N;i++){
+    u=i/N;
+    var y=Math.sin(f.wave-u*2.7)*L*0.075*Math.pow(u,1.3)*f.wag
+      +Math.sin(f.wave*0.5-u*1.1)*L*0.014*u;
+    pts.push({u:u,x:L*(0.5-u),y:y});
+  }
+  return pts;
+}
+function bodyHalfW(f,u){
+  var s=Math.sin(Math.PI*Math.pow(u,0.62)); if(s<0)s=0;
+  var w=Math.pow(s,0.8);
+  if(u>0.72) w=Math.max(w,0.26-(u-0.72)*0.4);
+  if(u<0.05) w*=0.45+(u/0.05)*0.55;
+  return f.maxW*w;
+}
+function spineFrame(pts,u){
+  var N=pts.length-1,x=u*N,i=Math.min(N-1,Math.max(0,Math.floor(x))),fr=x-i;
+  var a=pts[i],b=pts[i+1];
+  var tx=b.x-a.x,ty=b.y-a.y,tl=Math.hypot(tx,ty)||1;
+  return {x:a.x+(b.x-a.x)*fr,y:a.y+(b.y-a.y)*fr,nx:-ty/tl,ny:tx/tl,tx:tx/tl,ty:ty/tl};
+}
+function outlineOf(f,pts){
+  var N=pts.length-1,L=[],R=[],i,fr,w;
+  for(i=0;i<=N;i++){
+    fr=spineFrame(pts,pts[i].u); w=bodyHalfW(f,pts[i].u);
+    L.push({x:fr.x+fr.nx*w,y:fr.y+fr.ny*w});
+    R.push({x:fr.x-fr.nx*w,y:fr.y-fr.ny*w});
+  }
+  return {L:L,R:R};
+}
+function traceOutline(o){
+  var N=o.L.length-1,i;
+  ctx.beginPath(); ctx.moveTo(o.L[0].x,o.L[0].y);
+  for(i=1;i<=N;i++) ctx.lineTo(o.L[i].x,o.L[i].y);
+  for(i=N;i>=0;i--) ctx.lineTo(o.R[i].x,o.R[i].y);
+  ctx.closePath();
+}
+function drawTailFin(f,pts){
+  var end=pts[pts.length-1],prev=pts[pts.length-2];
+  var ang=Math.atan2(end.y-prev.y,end.x-prev.x);
+  var sway=Math.sin(f.wave-3.3)*0.28*f.wag;
+  var L=f.len;
+  var tl=L*(f.tailType==='fan'?0.40:(f.tailType==='round'?0.24:0.30));
+  var tw=L*(f.tailType==='fan'?0.30:(f.tailType==='lyre'?0.21:0.155))*(f.plump>1.3?1.2:1);
+  ctx.save(); ctx.translate(end.x,end.y); ctx.rotate(ang+sway);
+  var g=ctx.createLinearGradient(0,0,tl,0);
+  g.addColorStop(0,f.color); g.addColorStop(1,f.tailColor||f.color);
+  ctx.globalAlpha=0.88-(f.ghost||0)*0.35;
+  ctx.fillStyle=g;
+  ctx.beginPath();
+  if(f.tailType==='fan'){
+    ctx.moveTo(0,0);
+    ctx.quadraticCurveTo(tl*0.55,-tw*1.05,tl,-tw*0.42);
+    ctx.quadraticCurveTo(tl*1.07,0,tl,tw*0.42);
+    ctx.quadraticCurveTo(tl*0.55,tw*1.05,0,0);
+  } else if(f.tailType==='round'){
+    ctx.ellipse(tl*0.48,0,tl*0.55,tw*0.82,0,0,6.29);
+  } else {
+    var notch=f.tailType==='lyre'?0.5:0.66;
+    ctx.moveTo(0,0);
+    ctx.quadraticCurveTo(tl*0.5,-tw*0.8,tl,-tw);
+    ctx.quadraticCurveTo(tl*notch,0,tl,tw);
+    ctx.quadraticCurveTo(tl*0.5,tw*0.8,0,0);
+  }
+  ctx.closePath(); ctx.fill();
+  if(f.pattern==='piranha'){
+    // 尾鳍深色后缘
+    ctx.globalAlpha=0.55; ctx.strokeStyle='#262b31'; ctx.lineWidth=Math.max(1.5,f.len*0.02);
+    ctx.stroke();
+  }
+  if(f.tailType==='sword'){
+    ctx.beginPath();
+    ctx.moveTo(tl*0.86,tw*0.8); ctx.lineTo(tl*1.6,tw*1.3); ctx.lineTo(tl*0.68,tw*0.62); ctx.closePath();
+    ctx.fill();
+  }
+  ctx.globalAlpha=0.16; ctx.strokeStyle='#fff'; ctx.lineWidth=1;
+  for(var k=-2;k<=2;k++){
+    ctx.beginPath(); ctx.moveTo(tl*0.08,0); ctx.lineTo(tl*0.92,tw*k*0.42); ctx.stroke();
+  }
+  if(f.pattern==='guppy'){
+    var spots=[[.55,-.3],[.72,.14],[.6,.44],[.82,-.14],[.48,.02]];
+    ctx.globalAlpha=0.35; ctx.fillStyle='#fff';
+    spots.forEach(function(sp2){ ctx.beginPath(); ctx.arc(tl*sp2[0],tw*sp2[1],Math.max(1.2,tl*0.055),0,6.29); ctx.fill(); });
+    ctx.globalAlpha=0.18; ctx.fillStyle='#08312b';
+    spots.forEach(function(sp2){ ctx.beginPath(); ctx.arc(tl*sp2[0]+2,tw*sp2[1]+1,Math.max(1,tl*0.04),0,6.29); ctx.fill(); });
+  }
+  ctx.restore();
+}
+function drawSideFin(f,pts,o,dorsal){
+  var N=pts.length-1;
+  var u0=dorsal?0.26:0.64,u1=dorsal?0.64:0.86;
+  var i0=Math.round(u0*N),i1=Math.round(u1*N),i;
+  var finH=f.len*(dorsal?0.085:0.05)*(f.plump>1.3&&dorsal?0.7:1);
+  var side=dorsal?o.L:o.R,sgn=dorsal?1:-1;
+  ctx.save();
+  ctx.globalAlpha=(dorsal?0.5:0.42)*(1-(f.ghost||0)*0.4);
+  ctx.fillStyle=f.finColor;
+  ctx.beginPath();
+  ctx.moveTo(side[i0].x,side[i0].y);
+  for(i=i0;i<=i1;i++){
+    var fr=spineFrame(pts,pts[i].u);
+    var lift=finH*Math.sin(Math.PI*(i-i0)/Math.max(1,(i1-i0)));
+    ctx.lineTo(side[i].x+fr.nx*lift*sgn,side[i].y+fr.ny*lift*sgn);
+  }
+  for(i=i1;i>=i0;i--) ctx.lineTo(side[i].x,side[i].y);
+  ctx.closePath(); ctx.fill(); ctx.restore();
+}
+function drawFish(f,t){
+  var ang=Math.atan2(f.vy,f.vx);
+  var pts=spinePts(f);
+  var o=outlineOf(f,pts);
+  var ga=1-(f.ghost||0)*0.4;
+  ctx.save(); ctx.translate(f.x,f.y);
+  if(f.spin>0){ ctx.rotate(Math.sin((1-f.spin)*Math.PI*2)*0.6); }
+  ctx.rotate(ang);
+  drawTailFin(f,pts);
+  drawSideFin(f,pts,o,true);
+  drawSideFin(f,pts,o,false);
+  if(f.pattern==='piranha'){
+    // 脂鳍：背部尾柄前的小鳍，食人鱼特征
+    var af=spineFrame(pts,0.80),aw=bodyHalfW(f,0.80);
+    ctx.save();
+    ctx.globalAlpha=0.75*ga; ctx.fillStyle=f.finColor;
+    ctx.beginPath();
+    ctx.moveTo(af.x+af.nx*aw*0.85,af.y+af.ny*aw*0.85);
+    ctx.lineTo(af.x+af.nx*(aw+f.len*0.075),af.y+af.ny*(aw+f.len*0.075));
+    ctx.lineTo(af.x+af.nx*aw*0.6+af.tx*f.len*0.055,af.y+af.ny*aw*0.6+af.ty*f.len*0.055);
+    ctx.closePath(); ctx.fill();
+    ctx.restore();
+  }
+  var g=ctx.createLinearGradient(0,-f.maxW*1.2,0,f.maxW*1.2);
+  g.addColorStop(0,f.color); g.addColorStop(0.62,f.color); g.addColorStop(1,f.belly);
+  ctx.globalAlpha=ga;
+  traceOutline(o); ctx.fillStyle=g; ctx.fill();
+  ctx.save(); traceOutline(o); ctx.clip();
+  var sh=ctx.createLinearGradient(0,-f.maxW*1.2,0,f.maxW*1.2);
+  sh.addColorStop(0,'rgba(20,40,50,.20)'); sh.addColorStop(0.35,'rgba(20,40,50,0)');
+  sh.addColorStop(0.78,'rgba(255,255,255,0)'); sh.addColorStop(1,'rgba(255,255,255,.22)');
+  ctx.fillStyle=sh; ctx.fillRect(-f.len*0.55,-f.maxW*1.4,f.len*1.1,f.maxW*2.8);
+  if(f.patches.length){
+    ctx.globalAlpha=ga*0.94; ctx.fillStyle=f.patchColor;
+    f.patches.forEach(function(p){
+      var fr=spineFrame(pts,p.u),w=bodyHalfW(f,p.u);
+      var px=fr.x+fr.nx*p.off*w,py=fr.y+fr.ny*p.off*w;
+      ctx.save(); ctx.translate(px,py); ctx.rotate(p.rot);
+      ctx.beginPath(); ctx.ellipse(0,0,p.r*f.maxW*0.95,p.r*f.maxW*0.58,0,0,6.29); ctx.fill();
+      ctx.beginPath(); ctx.ellipse(p.r*f.maxW*0.3,p.r*f.maxW*0.18,p.r*f.maxW*0.55,p.r*f.maxW*0.34,0,0,6.29); ctx.fill();
+      ctx.restore();
+    });
+  }
+  if(f.pattern==='metal'){
+    var mg=ctx.createLinearGradient(-f.len*0.5,-f.maxW,-f.len*0.1,f.maxW*1.2);
+    mg.addColorStop(0,'rgba(255,255,255,0)'); mg.addColorStop(0.5,'rgba(255,255,255,.34)'); mg.addColorStop(1,'rgba(255,255,255,0)');
+    ctx.globalAlpha=ga; ctx.fillStyle=mg; ctx.fillRect(-f.len*0.55,-f.maxW*1.4,f.len*1.1,f.maxW*2.8);
+  }
+  ctx.globalAlpha=ga*(f.pattern==='metal'?0.16:0.10);
+  ctx.strokeStyle=mode==='night'?'#cfe8dd':'#20402e'; ctx.lineWidth=1;
+  var su,soff,row=0;
+  for(su=0.16;su<0.86;su+=0.085,row++){
+    var fr2=spineFrame(pts,su),w2=bodyHalfW(f,su);
+    for(soff=-0.55;soff<=0.56;soff+=0.55){
+      var px2=fr2.x+fr2.nx*soff*w2+fr2.tx*(row%2)*f.maxW*0.16;
+      var py2=fr2.y+fr2.ny*soff*w2+fr2.ty*(row%2)*f.maxW*0.16;
+      ctx.save(); ctx.translate(px2,py2); ctx.rotate(Math.atan2(fr2.ty,fr2.tx));
+      ctx.beginPath(); ctx.arc(0,0,f.maxW*0.30,Math.PI*0.12,Math.PI*0.88); ctx.stroke();
+      ctx.restore();
+    }
+  }
+  if(f.pattern==='piranha'){
+    // 红喉：头部下方泛红
+    var hf=spineFrame(pts,0.10),hw=bodyHalfW(f,0.10);
+    var hg=ctx.createRadialGradient(hf.x,hf.y,1,hf.x,hf.y,hw*1.7);
+    hg.addColorStop(0,'rgba(200,60,20,0.5)'); hg.addColorStop(1,'rgba(200,60,20,0)');
+    ctx.globalAlpha=ga; ctx.fillStyle=hg;
+    ctx.beginPath(); ctx.arc(hf.x-hf.nx*hw*0.3,hf.y-hf.ny*hw*0.3,hw*1.7,0,6.29); ctx.fill();
+    // 背部深色斑点（出生时定好，不闪烁）
+    if(f.speckles){
+      ctx.globalAlpha=ga*0.38; ctx.fillStyle='#22262c';
+      f.speckles.forEach(function(sp3){
+        var fr3=spineFrame(pts,sp3.u),w3=bodyHalfW(f,sp3.u);
+        ctx.beginPath();
+        ctx.arc(fr3.x+fr3.nx*sp3.off*w3,fr3.y+fr3.ny*sp3.off*w3,sp3.r*f.maxW*0.16,0,6.29);
+        ctx.fill();
+      });
+    }
+  }
+  if(f.neon){
+    ctx.globalAlpha=ga*0.95;
+    ctx.strokeStyle=f.neon; ctx.lineWidth=Math.max(1.6,f.len*0.045); ctx.lineCap='round';
+    ctx.shadowColor=f.neon; ctx.shadowBlur=8;
+    ctx.beginPath();
+    for(var nu=0.05;nu<=0.96;nu+=0.09){
+      var nf=spineFrame(pts,nu),nw=bodyHalfW(f,nu);
+      var nx2=nf.x+nf.nx*nw*0.08,ny2=nf.y+nf.ny*nw*0.08;
+      if(nu===0.05) ctx.moveTo(nx2,ny2); else ctx.lineTo(nx2,ny2);
+    }
+    ctx.stroke();
+    ctx.shadowBlur=0; ctx.globalAlpha=ga*0.55; ctx.strokeStyle='#fff'; ctx.lineWidth=Math.max(0.8,f.len*0.016);
+    ctx.stroke();
+  }
+  ctx.restore();
+  var pf=spineFrame(pts,0.30),pw=bodyHalfW(f,0.30);
+  ctx.save();
+  ctx.translate(pf.x-pf.nx*pw*0.5,pf.y-pf.ny*pw*0.5);
+  ctx.rotate(2.25+Math.sin(f.wave-0.9)*0.38*f.wag);
+  ctx.globalAlpha=0.55*ga; ctx.fillStyle=f.finColor;
+  ctx.beginPath(); ctx.ellipse(f.len*0.075,0,f.len*0.085,f.len*0.028,0,0,6.29); ctx.fill();
+  ctx.restore();
+  var gf=spineFrame(pts,0.21),gw=bodyHalfW(f,0.21);
+  ctx.save(); ctx.translate(gf.x,gf.y); ctx.rotate(Math.atan2(gf.ty,gf.tx));
+  ctx.globalAlpha=0.20*ga; ctx.strokeStyle='#3a2418'; ctx.lineWidth=1.2;
+  ctx.beginPath(); ctx.arc(0,0,gw*0.92,-1.05,1.05); ctx.stroke();
+  ctx.restore();
+  var ef=spineFrame(pts,0.085),ew=bodyHalfW(f,0.085);
+  var ex=ef.x+ef.nx*ew*0.34+ef.tx*ew*0.08,ey2=ef.y+ef.ny*ew*0.34+ef.ty*ew*0.08;
+  var er=Math.max(1.7,f.len*0.034);
+  ctx.globalAlpha=ga;
+  ctx.beginPath(); ctx.arc(ex,ey2,er,0,6.29); ctx.fillStyle=(f.pattern==='piranha'?'#a01a10':'#8a6a1f'); ctx.fill();
+  ctx.beginPath(); ctx.arc(ex,ey2,er*0.78,0,6.29); ctx.fillStyle='#241a10'; ctx.fill();
+  ctx.beginPath(); ctx.arc(ex-er*0.25,ey2-er*0.3,er*0.26,0,6.29); ctx.fillStyle='#fff'; ctx.fill();
+  if(f.pattern==='piranha'){
+    // 利齿：沿下颚排一排小三角牙
+    ctx.globalAlpha=ga; ctx.fillStyle='#f4f1e8';
+    for(var ti=0;ti<5;ti++){
+      var tu=0.015+ti*0.024;
+      var tf=spineFrame(pts,tu),tw=bodyHalfW(f,tu);
+      var tx=tf.x-tf.nx*tw*0.90,ty=tf.y-tf.ny*tw*0.90;
+      var s=Math.max(1.1,f.len*0.020);
+      ctx.beginPath();
+      ctx.moveTo(tx-s*0.7,ty); ctx.lineTo(tx+s*0.7,ty); ctx.lineTo(tx,ty+s*1.15);
+      ctx.closePath(); ctx.fill();
+    }
+    // 下颚线
+    ctx.globalAlpha=ga*0.5; ctx.strokeStyle='#3a1a10'; ctx.lineWidth=1.2;
+    ctx.beginPath();
+    for(var ju=0.01;ju<=0.17;ju+=0.032){
+      var jf=spineFrame(pts,ju),jw=bodyHalfW(f,ju);
+      var jx=jf.x-jf.nx*jw*0.86,jy=jf.y-jf.ny*jw*0.86;
+      if(ju===0.01) ctx.moveTo(jx,jy); else ctx.lineTo(jx,jy);
+    }
+    ctx.stroke();
+  }
+  ctx.restore();
+  if(showNames){
+    ctx.save();
+    ctx.font='600 11px -apple-system,"PingFang SC",sans-serif'; ctx.textAlign='center';
+    ctx.fillStyle=(greetIdx===fishes.indexOf(f)&&greetTimer>0)?'#ffd166':'rgba(255,255,255,.82)';
+    ctx.shadowColor='rgba(0,0,0,.45)'; ctx.shadowBlur=4;
+    ctx.fillText(f.name,f.x,f.y-f.maxW-12);
+    ctx.restore();
+  }
+}
+
+/* ---------- 植物：成丛水草 + 阔叶 ---------- */
+function drawPlant(pl,t,back){
+  var baseY=H-3;
+  if(pl.type==='leafy'){ drawLeafy(pl,baseY,t,back); return; }
+  pl.blades.forEach(function(b){
+    var sway=reduced?0:Math.sin(t*.0011+b.ph)*9*(back?0.6:1);
+    var tipX=pl.x+b.lean+sway,topY=baseY-b.h;
+    var g=ctx.createLinearGradient(0,baseY,0,topY);
+    if(back){ g.addColorStop(0,'rgba(70,140,110,.26)'); g.addColorStop(1,'rgba(125,195,155,.30)'); }
+    else { g.addColorStop(0,b.c0); g.addColorStop(1,b.c1); }
+    ctx.fillStyle=g;
+    ctx.beginPath();
+    ctx.moveTo(pl.x-b.w/2,baseY);
+    ctx.quadraticCurveTo(pl.x-b.w*0.3+b.lean*0.3+sway*0.3,baseY-b.h*0.55,tipX,topY);
+    ctx.quadraticCurveTo(pl.x+b.w*0.3+b.lean*0.55+sway*0.55,baseY-b.h*0.5,pl.x+b.w/2,baseY);
+    ctx.closePath(); ctx.fill();
+    if(!back&&!pl.dark){
+      ctx.beginPath(); ctx.moveTo(pl.x,baseY);
+      ctx.quadraticCurveTo(pl.x+b.lean*0.4+sway*0.4,baseY-b.h*0.55,tipX,topY);
+      ctx.strokeStyle='rgba(255,255,255,.13)'; ctx.lineWidth=1; ctx.stroke();
+    }
+  });
+}
+function drawLeafy(pl,baseY,t,back){
+  var sway=reduced?0:Math.sin(t*.001+pl.ph)*8;
+  var bend=pl.lean+sway;
+  ctx.beginPath(); ctx.moveTo(pl.x,baseY);
+  ctx.quadraticCurveTo(pl.x+bend*0.3,baseY-pl.h*0.55,pl.x+bend,baseY-pl.h);
+  ctx.strokeStyle=back?'rgba(70,140,110,.3)':'rgba(20,90,55,.85)';
+  ctx.lineWidth=3; ctx.lineCap='round'; ctx.stroke();
+  pl.leaves.forEach(function(lf){
+    var px=pl.x+bend*lf.v*lf.v,py=baseY-pl.h*lf.v;
+    ctx.save(); ctx.translate(px,py); ctx.scale(lf.side,1);
+    ctx.rotate(-0.55+(reduced?0:Math.sin(t*.0012+lf.ph)*0.10));
+    var g=ctx.createLinearGradient(0,0,lf.len,0);
+    if(back){ g.addColorStop(0,'rgba(80,150,115,.28)'); g.addColorStop(1,'rgba(125,195,155,.30)'); }
+    else { g.addColorStop(0,'rgba(18,96,54,.95)'); g.addColorStop(1,'rgba(96,205,130,.95)'); }
+    ctx.fillStyle=g;
+    ctx.beginPath(); ctx.ellipse(lf.len/2,0,lf.len/2,lf.wid,0,0,6.29); ctx.fill();
+    ctx.beginPath(); ctx.moveTo(1,0); ctx.lineTo(lf.len-1,0);
+    ctx.strokeStyle='rgba(255,255,255,.16)'; ctx.lineWidth=1; ctx.stroke();
+    ctx.restore();
+  });
+}
+
+/* ---------- 主循环 ---------- */
+var lastSpawn=0;
+function frame(t){
+  requestAnimationFrame(frame);
+  if(paused) return;
+  var m=MODES[mode];
+  var g=ctx.createLinearGradient(0,0,0,H);
+  g.addColorStop(0,m.top); g.addColorStop(.55,m.mid); g.addColorStop(1,m.bot);
+  ctx.fillStyle=g; ctx.fillRect(0,0,W,H);
+  var srf=ctx.createLinearGradient(0,0,0,30);
+  srf.addColorStop(0,'rgba(255,255,255,.16)'); srf.addColorStop(1,'rgba(255,255,255,0)');
+  ctx.fillStyle=srf; ctx.fillRect(0,0,W,30);
+  ctx.save(); ctx.globalAlpha=.10; ctx.fillStyle='#fffbe8';
+  ctx.beginPath(); ctx.ellipse(W*.3+Math.sin(t*.0002)*24,-10,W*.36,60,-.2,0,6.29); ctx.fill();
+  ctx.beginPath(); ctx.ellipse(W*.75,H*.2,90,26,.4,0,6.29); ctx.fill(); ctx.restore();
+  backPlants.forEach(function(pl){ drawPlant(pl,t,true); });
+  var sg=ctx.createLinearGradient(0,H-36,0,H);
+  sg.addColorStop(0,'rgba(26,40,30,0)'); sg.addColorStop(.45,'rgba(24,38,28,.55)'); sg.addColorStop(1,'rgba(15,27,19,.92)');
+  ctx.fillStyle=sg; ctx.fillRect(0,H-36,W,36);
+  pebbles.forEach(function(p){
+    ctx.beginPath(); ctx.ellipse(p.x,p.y+1.5,p.r,p.r*.55,0,0,6.29); ctx.fillStyle='rgba(0,0,0,.20)'; ctx.fill();
+    ctx.beginPath(); ctx.ellipse(p.x,p.y,p.r,p.r*.55,0,0,6.29); ctx.fillStyle='rgba(206,196,164,'+(p.a+0.12)+')'; ctx.fill();
+  });
+  plants.forEach(function(pl){ drawPlant(pl,t,false); });
+  if(t-lastSpawn>(reduced?900:420)){
+    lastSpawn=t;
+    var pl=plants[Math.floor(Math.random()*plants.length)];
+    if(pl) bubbles.push({x:pl.x+rand(-4,4),y:H-pl.h*.8,r:rand(1.5,3.6),vy:rand(.5,1),ph:rand(0,6)});
+  }
+  bubbles=bubbles.filter(function(b){ return b.y>-8; });
+  bubbles.forEach(function(b){
+    b.y-=b.vy; b.x+=Math.sin(t*.004+b.ph)*.3;
+    ctx.beginPath(); ctx.arc(b.x,b.y,b.r,0,6.29);
+    ctx.strokeStyle='rgba(255,255,255,.55)'; ctx.lineWidth=1; ctx.stroke();
+    ctx.beginPath(); ctx.arc(b.x-b.r*.3,b.y-b.r*.3,b.r*.3,0,6.29); ctx.fillStyle='rgba(255,255,255,.5)'; ctx.fill();
+  });
+  foods=foods.filter(function(fd){ return !fd.eaten && fd.y<H-14; });
+  foods.forEach(function(fd){
+    fd.y+=fd.vy; fd.x+=fd.drift+Math.sin(t*.003+fd.y*.05)*.15;
+    if(fd.y>H-16) fd.vy=0.05;
+    ctx.beginPath(); ctx.arc(fd.x,fd.y,fd.r,0,6.29); ctx.fillStyle='#8a5a26'; ctx.fill();
+    ctx.beginPath(); ctx.arc(fd.x-fd.r*.3,fd.y-fd.r*.3,fd.r*.35,0,6.29); ctx.fillStyle='#c98f3d'; ctx.fill();
+  });
+  fishes.forEach(function(f){
+    var depthA=0.20-Math.max(0,(H-f.y))/Math.max(1,H)*0.13;
+    ctx.beginPath(); ctx.ellipse(f.x,H-7,f.len*0.40,4.5,0,0,6.29);
+    ctx.fillStyle='rgba(2,18,12,'+Math.max(.05,depthA)+')'; ctx.fill();
+  });
+  // 食人鱼群：算出鱼群重心与平均速度，用于群游
+  var scx=0,scy=0,svx=0,svy=0,sn=0;
+  fishes.forEach(function(f){ if(f.pattern==='piranha'){ scx+=f.x; scy+=f.y; svx+=f.vx; svy+=f.vy; sn++; } });
+  if(sn>0){ scx/=sn; scy/=sn; svx/=sn; svy/=sn; }
+  fishes.forEach(function(f){
+    if(f.scared>0) f.scared--;
+    if(f.spin>0) f.spin=Math.max(0,f.spin-0.012);
+    var isP=f.pattern==='piranha';
+    var tgt=null,best=1e9;
+    foods.forEach(function(fd){ var d=(fd.x-f.x)*(fd.x-f.x)+(fd.y-f.y)*(fd.y-f.y); if(d<best){best=d;tgt=fd;} });
+    var maxV=f.scared>0?3.4:(mode==='night'?0.75:1.25)*f.speed*(isP&&tgt?1.6:1);
+    if(tgt && best<520*520){
+      var dx=tgt.x-f.x,dy=tgt.y-f.y,d=Math.max(12,Math.hypot(dx,dy));
+      var acc=isP?0.16:0.09; // 食人鱼抢食更凶：加速更快
+      f.vx+=(dx/d)*acc; f.vy+=(dy/d)*acc;
+      if(d<f.len*0.42){ tgt.eaten=true; satiety=Math.min(100,satiety+1.5); updatePanel(); }
+    } else {
+      f.vx+=rand(-.03,.03)+Math.sin(t*.0006+f.phase)*.012;
+      f.vy+=rand(-.015,.015);
+      if(isP&&sn>1){
+        // 群游：向鱼群重心靠拢 + 速度对齐，保持队形
+        var gx=scx-f.x,gy=scy-f.y,gd=Math.max(60,Math.hypot(gx,gy));
+        f.vx+=(gx/gd)*0.022+(svx-f.vx)*0.02;
+        f.vy+=(gy/gd)*0.022+(svy-f.vy)*0.02;
+      }
+    }
+    var M=44;
+    if(f.x<M) f.vx+=.06; if(f.x>W-M) f.vx-=.06;
+    if(f.y<40) f.vy+=.05; if(f.y>H-56) f.vy-=.05;
+    var sp=Math.hypot(f.vx,f.vy)||1;
+    if(sp>maxV){ f.vx=f.vx/sp*maxV; f.vy=f.vy/sp*maxV; }
+    if(sp<0.35){ f.vx*=1.05; f.vy*=1.05; }
+    f.wave+=(0.085+sp*0.075)*(reduced?0.45:1);
+    f.wag=f.scared>0?1.15:0.5+Math.min(0.6,sp*0.36);
+    f.x+=f.vx; f.y+=f.vy;
+    drawFish(f,t);
+  });
+  if(greetTimer>0) greetTimer--;
+  ripples=ripples.filter(function(r){ return r.r<r.max; });
+  ripples.forEach(function(r){
+    r.r+=1.6; r.a*=.965;
+    ctx.beginPath(); ctx.ellipse(r.x,r.y,r.r,r.r*.42,0,0,6.29);
+    ctx.strokeStyle='rgba(255,255,255,'+r.a+')'; ctx.lineWidth=1.6; ctx.stroke();
+    ctx.beginPath(); ctx.ellipse(r.x,r.y,r.r*.6,r.r*.25,0,0,6.29);
+    ctx.strokeStyle='rgba(255,255,255,'+(r.a*.6)+')'; ctx.stroke();
+  });
+  motes.forEach(function(mo){
+    mo.y-=mo.sp; mo.x+=Math.sin(t*.0007+mo.ph)*.12;
+    if(mo.y<-4){ mo.y=H+4; mo.x=rand(0,W); }
+    ctx.beginPath(); ctx.arc(mo.x,mo.y,mo.r,0,6.29); ctx.fillStyle='rgba(255,255,255,.15)'; ctx.fill();
+  });
+  frontPlants.forEach(function(pl){ drawPlant(pl,t,false); });
+  /* ---------- 天气层 ---------- */
+  spawnWeather();
+  if(effWeather==='cloudy'){
+    ctx.fillStyle='rgba(10,30,40,0.18)'; ctx.fillRect(0,0,W,H);
+  }
+  if(effWeather==='rain'){
+    ctx.strokeStyle='rgba(200,225,255,0.55)'; ctx.lineWidth=1;
+    rainDrops=rainDrops.filter(function(d){ return d.y<H+12; });
+    rainDrops.forEach(function(d){
+      d.y+=d.v; d.x+=d.lean;
+      ctx.beginPath(); ctx.moveTo(d.x,d.y); ctx.lineTo(d.x-d.lean*1.6,d.y-d.v*0.9); ctx.stroke();
+    });
+  }
+  if(effWeather==='snow'){
+    ctx.fillStyle='rgba(255,255,255,0.9)';
+    snowFlakes=snowFlakes.filter(function(s){ return s.y<H+8; });
+    snowFlakes.forEach(function(s){
+      s.y+=s.v; s.x+=Math.sin(t*.001+s.ph)*0.5;
+      ctx.beginPath(); ctx.arc(s.x,s.y,s.r,0,6.29); ctx.fill();
+    });
+  }
+  if(effWeather==='fog'){
+    var fg=ctx.createLinearGradient(0,0,0,H);
+    fg.addColorStop(0,'rgba(220,230,228,0.22)'); fg.addColorStop(1,'rgba(220,230,228,0.05)');
+    ctx.fillStyle=fg; ctx.fillRect(0,0,W,H);
+  }
+}
+requestAnimationFrame(frame);
+
+/* ---------- Swift 桥接：window.pond ---------- */
+window.pond={
+  setPaused:function(on){ paused=!!on; },
+  setSpeed:function(index){ applySpeed(index|0); },
+  setWeather:function(name){ applyWeather(String(name||'auto')); },
+  setSound:function(key,on){ setSoundInternal(String(key),!!on); },
+  showPanel:function(on){
+    showPanel=!!on; showNames=showPanel;
+    panelEl.classList.toggle('hidden',!showPanel);
+    hintEl.classList.toggle('hidden',!showPanel);
+  },
+  setEmbedded:function(on){ embedded=!!on; },
+  feed:function(){ centerFeed(); },
+  tapGlass:function(){ tapGlass(); },
+  addFish:function(){ return addFish(); }
+};
+})();
+</script>
+</body>
+</html>
